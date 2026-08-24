@@ -1,0 +1,183 @@
+# =============================================================================
+# docker-compose.yml
+#
+# Orquesta los tres servicios de la arquitectura Bank-Grade JWT:
+#
+#   nginx (edge / reverse proxy)
+#       -> api (Node.js / Express: autenticación y sesiones)
+#           -> redis (control de sesiones, Refresh Token Rotation)
+#
+# Todos los servicios comparten la red "bank-network" y se resuelven
+# entre sí por nombre de servicio (DNS interno de Docker), tal como
+# referencian nginx.conf ("api:3000") y env.js ("REDIS_HOST").
+#
+# Requiere un archivo .env en la raíz del proyecto con las variables
+# consumidas por el servicio "api" (ver sección 28 del README y
+# .env.example).
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------
+  # api
+  #
+  # Servicio principal de la aplicación: expone los endpoints de
+  # autenticación y recursos protegidos (ver src/app.js). No se expone
+  # directamente al exterior; solo es accesible a través de "nginx".
+  # ---------------------------------------------------------------------
+  api:
+
+    # Construye la imagen a partir del Dockerfile ubicado en ./app,
+    # en lugar de utilizar una imagen publicada en un registry.
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+
+    # Nombre fijo del contenedor, útil para comandos manuales como
+    # "docker exec -it bank-grade-api ..." o para referenciarlo en logs.
+    container_name: bank-grade-api
+
+    # Reinicia el contenedor automáticamente ante fallos o reinicios del
+    # host, salvo que haya sido detenido explícitamente por el usuario
+    # ("docker compose stop").
+    restart: unless-stopped
+
+    # Variables de entorno inyectadas al contenedor, resueltas desde el
+    # archivo .env del host mediante la sintaxis ${VARIABLE}. Estas son
+    # las mismas variables validadas y consumidas por src/config/env.js.
+    environment:
+
+      # Entorno de ejecución y puerto de escucha de la API.
+      NODE_ENV: ${NODE_ENV}
+      PORT: ${PORT}
+
+      # Credenciales del usuario de laboratorio
+      APP_USER_ID: ${APP_USER_ID}
+      APP_USERNAME: ${APP_USERNAME}
+      APP_PASSWORD: ${APP_PASSWORD}
+      APP_ROLE: ${APP_ROLE}
+
+      # Secreto de firma y duración del Access Token
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN}
+
+      # Configuración de conexión al servicio "redis" definido más abajo.
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+
+    # Garantiza que el contenedor "api" no arranque hasta que "redis"
+    # reporte un healthcheck exitoso, evitando fallos de conexión al
+    # inicio (la API depende de Redis para el control de sesiones).
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    # Red interna compartida con "redis" y "nginx", permitiendo la
+    # resolución por nombre de servicio (por ejemplo, REDIS_HOST=redis).
+    networks:
+      - bank-network
+
+
+  # ---------------------------------------------------------------------
+  # redis
+  #
+  # Almacén de sesiones utilizado por session.service.js: creación,
+  # consulta, rotación atómica de Refresh Tokens (vía Lua Script) y
+  # revocación de sesiones.
+  # ---------------------------------------------------------------------
+  redis:
+
+    # Imagen oficial de Redis 7 en su variante Alpine (liviana).
+    image: redis:7-alpine
+
+    container_name: bank-grade-redis
+
+    restart: unless-stopped
+
+    # Habilita persistencia AOF (Append Only File), de modo que las
+    # sesiones activas sobrevivan a un reinicio del contenedor en lugar
+    # de perderse (Redis, por defecto, es solo en memoria).
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+
+    # Monta un volumen nombrado para persistir los datos de Redis
+    # (incluyendo el archivo AOF) fuera del ciclo de vida del contenedor.
+    volumes:
+      - redis-data:/data
+
+    # Healthcheck utilizado por "api" (ver depends_on más arriba) para
+    # esperar a que Redis esté realmente listo para aceptar comandos,
+    # no solo a que el contenedor haya arrancado.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ]
+      interval: 5s   # Frecuencia de cada verificación.
+      timeout: 3s    # Tiempo máximo de espera por respuesta.
+      retries: 5     # Intentos fallidos antes de marcar "unhealthy".
+
+    networks:
+      - bank-network
+
+
+  # ---------------------------------------------------------------------
+  # nginx
+  #
+  # Reverse proxy y único punto de entrada expuesto al host (ver
+  # nginx/nginx.conf). Redirige todo el tráfico hacia el servicio "api".
+  # ---------------------------------------------------------------------
+  nginx:
+
+    # Imagen oficial de Nginx 1.27 en su variante Alpine (liviana).
+    image: nginx:1.27-alpine
+
+    container_name: bank-grade-nginx
+
+    restart: unless-stopped
+
+    # Publica el puerto 80 del contenedor como el puerto 8080 del host.
+    # Es el único puerto expuesto externamente en toda la arquitectura.
+    ports:
+      - "8080:80"
+
+    # Monta la configuración de Nginx del host dentro del contenedor en
+    # modo solo lectura (":ro"), evitando que el contenedor la modifique.
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+    # Espera a que el contenedor "api" haya arrancado antes de iniciar
+    # Nginx. A diferencia de "redis", no se usa una condición de
+    # healthcheck aquí, solo el orden de arranque del contenedor.
+    depends_on:
+      - api
+
+    networks:
+      - bank-network
+
+
+# =============================================================================
+# Redes
+# =============================================================================
+networks:
+
+  # Red tipo "bridge" (por defecto en Docker) compartida por los tres
+  # servicios, que permite la comunicación interna por nombre de
+  # servicio sin exponer puertos innecesarios al host.
+  bank-network:
+    driver: bridge
+
+
+# =============================================================================
+# Volúmenes
+# =============================================================================
+volumes:
+
+  # Volumen nombrado y gestionado por Docker donde Redis persiste su
+  # archivo AOF y demás datos, sobreviviendo a la recreación del
+  # contenedor "redis".
+  redis-data:
