@@ -310,6 +310,8 @@ bank-grade-jwt/
     └── utils/
         └── token.utils.js
 ```
+### 7.1. NodeJs como base del proyecto
+El proyecto está construido utilizando nodejs, por lo cual será necesario instalar las dependiencias, para esto solo es necesario ingresar a la carpeta app y realizar la instalación de las mismas
 
 ## 8. Responsabilidad de cada componente
 
